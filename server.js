@@ -83,7 +83,31 @@ setInterval(() => {
         player.y = Math.max(player.radius, Math.min(MAP_HEIGHT - player.radius, player.y));
     }
     const playerIds = Object.keys(players);
-    for (let i = 0; i < playerIds.length; i++) { for (let j = i + 1; j < playerIds.length; j++) { const p1 = players[playerIds[i]]; const p2 = players[playerIds[j]]; if (!p1.isAlive || !p2.isAlive) continue; const dx = p1.x - p2.x; const dy = p1.y - p2.y; const distance = Math.sqrt(dx * dx + dy * dy); const p1_hitboxRadius = p1.radius / 4; const p2_hitboxRadius = p2.radius / 4; if (distance < p1_hitboxRadius + p2_hitboxRadius) { let eaten; if (p1.radius > p2.radius) { eaten = p2; } else if (p2.radius > p1.radius) { eaten = p1; } else { continue; } eaten.isAlive = false; eaten.deathTime = Date.now(); eaten.speed = 0; } } }
+    for (let i = 0; i < playerIds.length; i++) {
+        for (let j = i + 1; j < playerIds.length; j++) {
+            const p1 = players[playerIds[i]];
+            const p2 = players[playerIds[j]];
+            if (!p1.isAlive || !p2.isAlive) continue;
+            const dx = p1.x - p2.x;
+            const dy = p1.y - p2.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+
+            // ## REVISED: Collision Logic ##
+            // The hitbox is now 1/2 of the visible radius, not 1/4.
+            const p1_hitboxRadius = p1.radius / 2;
+            const p2_hitboxRadius = p2.radius / 2;
+            
+            if (distance < p1_hitboxRadius + p2_hitboxRadius) {
+                let eaten;
+                if (p1.radius > p2.radius) { eaten = p2; } 
+                else if (p2.radius > p1.radius) { eaten = p1; } 
+                else { continue; }
+                eaten.isAlive = false;
+                eaten.deathTime = Date.now();
+                eaten.speed = 0;
+            }
+        }
+    }
     const gameState = { type: 'state', players: players };
     wss.clients.forEach(client => { if (client.readyState === WebSocket.OPEN) { client.send(JSON.stringify(gameState)); } });
 }, 1000 / 60);
