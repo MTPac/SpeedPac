@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dot Game - Pac-Man Arena</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; cursor: crosshair; }
+        canvas { display: block; }
+        #respawn-text { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 48px; color: white; display: none; }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+    <div id="respawn-text"></div>
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const respawnText = document.getElementById('respawn-text');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+
+        const THRUST_FACTOR = 0.00015;
+        const BRAKE_POWER = 0.1;
+        const FRICTION = 0.99;
+        const COASTING_FRICTION = 0.9983;
+        const MAX_SPEED = 200;
+        const ROTATIONAL_FRICTION_FACTOR = 0.1;
+        const BASE_PLAYER_RADIUS = 10;
+        const RESPAWN_TIME = 10000;
+        const MAP_WIDTH = 5000;
+        const MAP_HEIGHT = 2800;
+        const GRID_SIZE = 300;
+        const SERVER_TICK_RATE = 1000 / 60;
+        const MAX_MOUTH_ANGLE = Math.PI / 4;
+        const ANIMATION_SPEED_FACTOR = 0.01;
+
+        let players = {};
+        let previousPlayers = {};
+        let myId = null;
+        let lastUpdateTime = 0;
+        const keys = { w: false, s: false };
+        const camera = { x: 0, y: 0 };
+        const mouse = { x: 0, y: 0 };
+        let pendingInputs = [];
+        let inputSequenceNumber = 0;
+        let audioCtx = null;
+        let playerAudioNodes = {};
+
+        function initAudio() {
+            if (audioCtx) return;
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                if (audioCtx.state === 'suspended') { audioCtx.resume(); }
+            } catch (e) { console.error("Web Audio API not supported", e); }
+        }
+
+        function initAudioForPlayer(playerId) {
+            if (!audioCtx || playerAudioNodes[playerId]) return;
+            const gainNode = audioCtx.createGain();
+            gainNode.gain.value = 0;
+            const pannerNode = audioCtx.createPanner();
+            pannerNode.panningModel = 'HRTF';
+            pannerNode.distanceModel = 'inverse';
+            pannerNode.refDistance = 50;
+            pannerNode.maxDistance = 10000;
+            pannerNode.rolloffFactor = 1;
+            const oscillator = audioCtx.createOscillator();
+            oscillator.type = 'square';
+            oscillator.frequency.setValueAtTime(100, audioCtx.currentTime);
+            oscillator.connect(pannerNode).connect(gainNode).connect(audioCtx.destination);
+            oscillator.start();
+            playerAudioNodes[playerId] = { oscillator, pannerNode, gainNode, nextWakaTime: 0 };
+        }
+
+        function cleanupAudioForPlayer(playerId) {
+            if (playerAudioNodes[playerId]) {
+                playerAudioNodes[playerId].oscillator.stop();
+                delete playerAudioNodes[playerId];
+            }
+        }
+
+        function updateAllPlayerSounds() {
+            if (!audioCtx || !players[myId]) return;
+            const listener = audioCtx.listener;
+            listener.positionX.setValueAtTime(players[myId].x, audioCtx.currentTime);
+            listener.positionY.setValueAtTime(players[myId].y, audioCtx.currentTime);
+            for (const id in players) {
+                const player = players[id];
+                const audio = playerAudioNodes[id];
+                if (!player.isAlive || !audio) continue;
+                audio.pannerNode.positionX.setValueAtTime(player.x, audioCtx.currentTime);
+                audio.pannerNode.positionY.setValueAtTime(player.y, audioCtx.currentTime);
+                const speed = Math.abs(player.speed);
+                if (speed < 1) {
+                    audio.gainNode.gain.cancelScheduledValues(audioCtx.currentTime);
+                    audio.gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+                    continue;
+                }
+                const maxDelay = 250; const minDelay = 60;
+                const speedRatio = Math.min(speed / (MAX_SPEED * 0.75), 1.0);
+                const currentDelay = maxDelay - ((maxDelay - minDelay) * speedRatio);
+                const now = performance.now();
+                if (now > audio.nextWakaTime) {
+                    const volume = (id === myId) ? 0.1 : 0.15;
+                    audio.gainNode.gain.setValueAtTime(volume, audioCtx.currentTime);
+                    audio.gainNode.gain.setValueAtTime(0, audioCtx.currentTime + 0.04);
+                    audio.nextWakaTime = now + currentDelay;
+                }
+            }
+        }
+
+        function connectAndStart() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const SERVER_URL = `${protocol}//${window.location.host}`;
+            const socket = new WebSocket(SERVER_URL);
+            socket.onopen = () => {
+                console.log("Successfully connected!");
+                setInterval(() => {
+                    if (socket.readyState === WebSocket.OPEN) {
+                        const targetAngle = Math.atan2(mouse.y - canvas.height / 2, mouse.x - canvas.width / 2);
+                        inputSequenceNumber++;
+                        const input = { type: 'input', sequence: inputSequenceNumber, keys: keys, targetAngle: targetAngle };
+                        socket.send(JSON.stringify(input));
+                        pendingInputs.push(input);
+                    }
+                }, 1000 / 30);
+            };
+            socket.onclose = () => { alert("Connection lost."); };
+            socket.onerror = () => { alert(`Could not connect to the server.`); };
+            socket.onmessage = (event) => {
+                const gameState = JSON.parse(event.data);
+                if (gameState.type === 'id') { myId = gameState.id; return; }
+                if (gameState.type === 'state') {
+                    previousPlayers = JSON.parse(JSON.stringify(players));
+                    const newServerPlayers = gameState.players;
+                    for (const id in newServerPlayers) {
+                        const serverPlayer = newServerPlayers[id];
+                        let existingAnimationCounter = 0;
+                        if (players[id]) { existingAnimationCounter = players[id].animationCounter || 0; }
+                        if (!players[id]) {
+                            initAudioForPlayer(id);
+                        }
+                        if (id === myId) {
+                            if (players[myId]) {
+                                Object.assign(players[myId], serverPlayer);
+                                pendingInputs = pendingInputs.filter(input => input.sequence > serverPlayer.lastProcessedInput);
+                                pendingInputs.forEach(input => applyInput(players[myId], input));
+                            } else { players[myId] = serverPlayer; }
+                        } else { players[id] = serverPlayer; }
+                        players[id].animationCounter = existingAnimationCounter;
+                    }
+                    for (const id in players) {
+                        if (!newServerPlayers[id]) {
+                            cleanupAudioForPlayer(id);
+                            delete players[id];
+                            delete previousPlayers[id];
+                        }
+                    }
+                    lastUpdateTime = Date.now();
+                }
+            };
+            window.addEventListener('keydown', (e) => { if (e.key === 'w' || e.key === 's') keys[e.key] = true; });
+            window.addEventListener('keyup', (e) => { if (e.key === 'w' || e.key === 's') keys[e.key] = false; });
+            window.addEventListener('mousemove', (e) => { mouse.x = e.clientX; mouse.y = e.clientY; });
+            gameLoop();
+        }
+
+        function applyInput(player, input) { let angleDiff = input.targetAngle - player.angle; while (angleDiff < -Math.PI) angleDiff += 2 * Math.PI; while (angleDiff > Math.PI) angleDiff -= 2 * Math.PI; const deltaAngle = Math.abs(angleDiff); player.angle = input.targetAngle; const rotationalFriction = 1.0 - (deltaAngle * ROTATIONAL_FRICTION_FACTOR); player.speed *= rotationalFriction; if (input.keys.w) { player.speed += (MAX_SPEED - player.speed) * THRUST_FACTOR; } else if (input.keys.s) { player.speed -= BRAKE_POWER; player.speed *= FRICTION; } else { player.speed *= COASTING_FRICTION; } if (player.speed > MAX_SPEED) player.speed = MAX_SPEED; if (player.speed < -MAX_SPEED / 2) player.speed = -MAX_SPEED / 2; player.x += player.speed * Math.cos(player.angle); player.y += player.speed * Math.sin(player.angle); player.radius = BASE_PLAYER_RADIUS * (1 + 30 * (Math.abs(player.speed) / MAX_SPEED)); }
+        function drawBackground() { const centerX = MAP_WIDTH / 2; const centerY = MAP_HEIGHT / 2; const gradientRadius = Math.max(MAP_WIDTH / 2, MAP_HEIGHT / 2); const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, gradientRadius); gradient.addColorStop(0, '#444'); gradient.addColorStop(1, '#000'); ctx.fillStyle = gradient; ctx.fillRect(0, 0, MAP_WIDTH, MAP_HEIGHT); }
+        function drawGrid() { ctx.strokeStyle = '#800'; ctx.lineWidth = 1; for (let x = 0; x <= MAP_WIDTH; x += GRID_SIZE) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, MAP_HEIGHT); ctx.stroke(); } for (let y = 0; y <= MAP_HEIGHT; y += GRID_SIZE) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(MAP_WIDTH, y); ctx.stroke(); } }
+        function drawPlayerIndicators(myPlayer) { for (const id in players) { if (id === myId || !players[id].isAlive) continue; const otherPlayer = players[id]; const dx = otherPlayer.x - myPlayer.x; const dy = otherPlayer.y - myPlayer.y; const distance = Math.sqrt(dx * dx + dy * dy); const screenRadius = Math.min(canvas.width, canvas.height) / 2; if (distance < screenRadius) continue; const angleToPlayer = Math.atan2(dy, dx); const indicatorRadius = screenRadius * 0.9; const screenX = canvas.width / 2 + indicatorRadius * Math.cos(angleToPlayer); const screenY = canvas.height / 2 + indicatorRadius * Math.sin(angleToPlayer); ctx.save(); ctx.translate(screenX, screenY); ctx.rotate(angleToPlayer); ctx.fillStyle = otherPlayer.color; ctx.globalAlpha = 0.8; ctx.beginPath(); ctx.moveTo(15, 0); ctx.lineTo(-15, -10); ctx.lineTo(-15, 10); ctx.closePath(); ctx.fill(); ctx.restore(); } }
+
+        function gameLoop() {
+            if (myId && players[myId] && players[myId].isAlive) {
+                const player = players[myId];
+                const targetAngle = Math.atan2(mouse.y - canvas.height / 2, mouse.x - canvas.width / 2);
+                const currentInput = { keys: keys, targetAngle: targetAngle };
+                applyInput(player, currentInput);
+                player.animationCounter = (player.animationCounter || 0) + Math.abs(player.speed) * ANIMATION_SPEED_FACTOR;
+            }
+            if (myId && players[myId]) { camera.x = players[myId].x; camera.y = players[myId].y; }
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(canvas.width / 2 - camera.x, canvas.height / 2 - camera.y);
+            drawBackground();
+            drawGrid();
+            const renderTime = Date.now() - lastUpdateTime;
+            const interpolationFactor = Math.min(renderTime / SERVER_TICK_RATE, 1.0);
+            for (const id in players) {
+                const player = players[id];
+                if (!player.isAlive) continue;
+                if (player.animationCounter === undefined) player.animationCounter = 0;
+                let renderX = player.x, renderY = player.y, renderRadius = player.radius, renderAngle = player.angle;
+                if (id !== myId && previousPlayers[id]) {
+                    const prev = previousPlayers[id];
+                    renderX = prev.x + (player.x - prev.x) * interpolationFactor;
+                    renderY = prev.y + (player.y - prev.y) * interpolationFactor;
+                    renderRadius = prev.radius + (player.radius - prev.radius) * interpolationFactor;
+                    renderAngle = prev.angle + ((player.angle - prev.angle) * interpolationFactor);
+                    const interpolatedSpeed = Math.abs(prev.speed + (player.speed - prev.speed) * interpolationFactor);
+                    player.animationCounter += interpolatedSpeed * ANIMATION_SPEED_FACTOR;
+                }
+                let mouthAngle = 0;
+                const currentSpeed = (id === myId) ? player.speed : (previousPlayers[id] ? Math.abs(previousPlayers[id].speed + (player.speed - previousPlayers[id].speed) * interpolationFactor) : 0);
+                if (Math.abs(currentSpeed) > 0.1) { mouthAngle = Math.abs(Math.sin(player.animationCounter)) * MAX_MOUTH_ANGLE; }
+                ctx.beginPath();
+                if (mouthAngle > 0.001) { ctx.moveTo(renderX, renderY); ctx.arc(renderX, renderY, renderRadius, renderAngle - mouthAngle, renderAngle + mouthAngle, true); }
+                else { ctx.arc(renderX, renderY, renderRadius, 0, 2 * Math.PI); }
+                ctx.closePath();
+                ctx.fillStyle = (id === myId) ? 'lime' : player.color;
+                ctx.fill();
+            }
+            ctx.restore();
+            if (myId && players[myId]) {
+                drawPlayerIndicators(players[myId]);
+                updateAllPlayerSounds();
+            }
+            if (myId && players[myId] && !players[myId].isAlive) { const timeToRespawn = (RESPAWN_TIME - (Date.now() - players[myId].deathTime)) / 1000; respawnText.style.display = 'block'; respawnText.textContent = `DIED! RESPAWNING IN ${Math.ceil(timeToRespawn)}...`; } else { respawnText.style.display = 'none'; }
+            requestAnimationFrame(gameLoop);
+        }
+        window.addEventListener('mousedown', () => { initAudio(); connectAndStart(); }, { once: true });
+    </script>
+</body>
+</html>
